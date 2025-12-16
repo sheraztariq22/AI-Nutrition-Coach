@@ -1,244 +1,166 @@
-import gradio as gr
+import requests
+import re
 import base64
-import time
-from src.crew import NourishBotRecipeCrew, NourishBotAnalysisCrew
+import os
+from ibm_watsonx_ai import Credentials
+from ibm_watsonx_ai import APIClient
+from ibm_watsonx_ai.foundation_models import Model, ModelInference
+from ibm_watsonx_ai.foundation_models.schema import TextChatParameters
+from ibm_watsonx_ai.metanames import GenTextParamsMetaNames
+from PIL import Image
+from flask import Flask, render_template, request, redirect, url_for, flash
 
-def format_recipe_output(final_output):
-    """
-    Formats the recipe output into a table-based Markdown format.
-    
-    :param final_output: The output from the NourishBotRecipe workflow.
-    :return: Formatted output as a Markdown string.
-    """
-    output = "## 🍽 Recipe Ideas\n\n"
-    recipes = []
+app = Flask(__name__)
 
-    # Check if final_output directly contains recipes
-    if "recipes" in final_output:
-        recipes = final_output["recipes"]
+credentials = Credentials(
+                   url = "https://us-south.ml.cloud.ibm.com",
+                   # api_key = "<YOUR_API_KEY>" # Normally you'd put an API key here, but we've got you covered here
+                  )
+client = APIClient(credentials)
+model_id = "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
+project_id = "skills-network"
+params = TextChatParameters()
+
+model = ModelInference(
+    model_id=model_id,
+    credentials=credentials,
+    project_id=project_id,
+    params=params
+)
+
+def input_image_setup(uploaded_file):
+    """
+    Encodes the uploaded image file into a base64 string to be used with AI models.
+
+    Parameters:
+    - uploaded_file: File-like object uploaded via a file uploader (Streamlit or other frameworks)
+
+    Returns:
+    - encoded_image (str): Base64 encoded string of the image data
+    """
+    # Check if a file has been uploaded
+    if uploaded_file is not None:
+        # Read the file into bytes
+        bytes_data = uploaded_file.read()
+
+        # Encode the image to a base64 string
+        encoded_image = base64.b64encode(bytes_data).decode("utf-8")
+
+        return encoded_image
     else:
-        # Fallback: try to extract from nested task output
-        recipe_task_output = final_output.get("recipe_suggestion_task")
-        if recipe_task_output and hasattr(recipe_task_output, "json_dict") and recipe_task_output.json_dict:
-            recipes = recipe_task_output.json_dict.get("recipes", [])
-    
-    if recipes:
-        for idx, recipe in enumerate(recipes, 1):
-            output += f"### {idx}. {recipe['title']}\n\n"
-            
-            # Create a table for ingredients
-            output += "**Ingredients:**\n"
-            output += "| Ingredient |\n"
-            output += "|------------|\n"
-            for ingredient in recipe['ingredients']:
-                output += f"| {ingredient} |\n"
-            output += "\n"
-            
-            # Display instructions and calorie estimate
-            output += f"**Instructions:**\n{recipe['instructions']}\n\n"
-            output += f"**Calorie Estimate:** {recipe['calorie_estimate']} kcal\n\n"
-            output += "---\n\n"
-    else:
-        output += "No recipes could be generated."
-    
-    return output
-
-def format_analysis_output(final_output):
-    """
-    Formats nutritional analysis output into a table-based Markdown format,
-    including health evaluation at the end.
-    
-    :param final_output: The JSON output from the NourishBotAnalysis workflow.
-    :return: Formatted output as a Markdown string.
-    """
-    output = "## 🥗 Nutritional Analysis\n\n"
-    
-    # Basic dish information
-    if dish := final_output.get('dish'):
-        output += f"**Dish:** {dish}\n\n"
-    if portion := final_output.get('portion_size'):
-        output += f"**Portion Size:** {portion}\n\n"
-    if est_cal := final_output.get('estimated_calories'):
-        output += f"**Estimated Calories:** {est_cal} calories\n\n"
-    if total_cal := final_output.get('total_calories'):
-        output += f"**Total Calories:** {total_cal} calories\n\n"
-
-    # Nutrient breakdown table
-    output += "**Nutrient Breakdown:**\n\n"
-    output += "| **Nutrient**       | **Amount** |\n"
-    output += "|--------------------|------------|\n"
-    
-    nutrients = final_output.get('nutrients', {})
-    # Display macronutrients
-    for macro in ['protein', 'carbohydrates', 'fats']:
-        if value := nutrients.get(macro):
-            output += f"| **{macro.capitalize()}** | {value} |\n"
-    
-    # Display vitamins table if available
-    vitamins = nutrients.get('vitamins', [])
-    if vitamins:
-        output += "\n**Vitamins:**\n\n"
-        output += "| **Vitamin** | **%DV** |\n"
-        output += "|-------------|--------|\n"
-        for v in vitamins:
-            name = v.get('name', 'N/A')
-            dv = v.get('percentage_dv', 'N/A')
-            output += f"| {name} | {dv} |\n"
-    
-    # Display minerals table if available
-    minerals = nutrients.get('minerals', [])
-    if minerals:
-        output += "\n**Minerals:**\n\n"
-        output += "| **Mineral** | **Amount** |\n"
-        output += "|-------------|-----------|\n"
-        for m in minerals:
-            name = m.get('name', 'N/A')
-            amount = m.get('amount', 'N/A')
-            output += f"| {name} | {amount} |\n"
-    
-    # Append health evaluation at the end
-    if health_eval := final_output.get('health_evaluation'):
-        output += "\n**Health Evaluation:**\n\n"
-        output += health_eval + "\n"
-    
-    return output
-
-
-def analyze_food(image, dietary_restrictions, workflow_type, progress=gr.Progress(track_tqdm=True)):
-    """
-    Wrapper function for the Gradio interface.
-    
-    :param image: Uploaded image (PIL format)
-    :param dietary_restrictions: Dietary restriction as a string (e.g., "vegan")
-    :param workflow_type: Workflow type ("recipe" or "analysis")
-    :return: Result from the NourishBot workflow.
-    """
-    
-    image.save("uploaded_image.jpg")  # Save the uploaded image temporarily
-    image_path = "uploaded_image.jpg"
-
-    inputs = {
-        'uploaded_image': image_path,
-        'dietary_restrictions': dietary_restrictions,
-        'workflow_type': workflow_type
-    }
-    
-    # Initialize the appropriate crew instance based on workflow type
-    if workflow_type == "recipe":
-        crew_instance = NourishBotRecipeCrew(
-            image_data=image_path,
-            dietary_restrictions=dietary_restrictions
-        )
-    elif workflow_type == "analysis":
-        crew_instance = NourishBotAnalysisCrew(
-            image_data=image_path
-        )
-    else:
-        return "Invalid workflow type. Choose 'recipe' or 'analysis'."
-
-    # Run the crew workflow and get the result
-    crew_obj = crew_instance.crew()
-    final_output = crew_obj.kickoff(inputs=inputs)
-
-    final_output = final_output.to_dict()
-
-    if workflow_type == "recipe":
-        recipe_markdown = format_recipe_output(final_output)
-        return recipe_markdown
-    elif workflow_type == "analysis":
-        nutrient_markdown = format_analysis_output(final_output)
-        return nutrient_markdown
-    
-# Define custom CSS for styling
-css = """
-.title {
-    font-size: 1.5em !important; 
-    text-align: center !important;
-    color: #FFD700; 
-}
-
-.text {
-    text-align: center;
-}
-"""
-
-js = """
-function createGradioAnimation() {
-    var container = document.createElement('div');
-    container.id = 'gradio-animation';
-    container.style.fontSize = '2em';
-    container.style.fontWeight = 'bold';
-    container.style.textAlign = 'center';
-    container.style.marginBottom = '20px';
-    container.style.color = '#eba93f';
-
-    var text = 'Welcome to your AI NourishBot!';
-    for (var i = 0; i < text.length; i++) {
-        (function(i){
-            setTimeout(function(){
-                var letter = document.createElement('span');
-                letter.style.opacity = '0';
-                letter.style.transition = 'opacity 0.1s';
-                letter.innerText = text[i];
-
-                container.appendChild(letter);
-
-                setTimeout(function() {
-                    letter.style.opacity = '0.9';
-                }, 50);
-            }, i * 250);
-        })(i);
-    }
-
-    var gradioContainer = document.querySelector('.gradio-container');
-    gradioContainer.insertBefore(container, gradioContainer.firstChild);
-
-    return 'Animation created';
-}
-"""
-# Use a theme and custom CSS with Blocks
-with gr.Blocks(theme=gr.themes.Citrus(), css=css, js=js) as demo:
-    gr.Markdown("# How it works", elem_classes="title")
-    gr.Markdown("Upload an image of your fridge content, enter your dietary restriction (if you have any!) and select a workflow type 'recipe' then click 'Analyze' to get recipe ideas.", elem_classes="text")
-    gr.Markdown("Upload an image of a complete dish, leave dietary restriction blank and select a workflow type 'analysis' then click 'Analyze' to get nutritional insights.", elem_classes="text")
-    gr.Markdown("You can also select one of the examples provided to autofill the input sections and click 'Analyze' right away!", elem_classes="text")
-
-    with gr.Row():
-        with gr.Column(scale=1, min_width=400):
-            gr.Markdown("## Inputs", elem_classes="title")
-            image_input = gr.Image(type="pil", label="Upload Image")
-            dietary_input = gr.Textbox(label="Dietary Restrictions (optional)", placeholder="e.g., vegan")
-            workflow_radio = gr.Radio(["recipe", "analysis"], label="Workflow Type")
-            submit_btn = gr.Button("Analyze")
+        raise FileNotFoundError("No file uploaded")
         
-        with gr.Column(scale=2, min_width=600):
-            # Place Examples directly under the Analyze button
-            gr.Examples(
-                examples=[
-                    ["examples/food-1.jpg", "vegan", "recipe"],
-                    ["examples/food-2.jpg", "", "analysis"],
-                    ["examples/food-3.jpg", "keto", "recipe"],
-                    ["examples/food-4.jpg", "", "analysis"],
-                ],
-                inputs=[image_input, dietary_input, workflow_radio],
-                label="Try an Example: Select one of the examples below to autofil the input section then click Analyze"
-                # No function or outputs provided, so it only autofills inputs
-            )
-            gr.Markdown("## Results will appear here...", elem_classes="title")
-            # result_display = gr.Markdown(height=800, )
-            result_display = gr.Markdown(
-                "<div style='border: 1px solid #ccc; "
-                "padding: 1rem; text-align: center; "
-                "color: #666;'>No results yet</div>",
-                height=500
-            )
+def format_response(response_text):
+    """
+    Formats the model response to display each item on a new line as a list.
+    Converts numbered items into HTML `<ul>` and `<li>` format.
+    Adds additional HTML elements for better presentation of headings and separate sections.
+    """
+    # Replace section headers that are bolded with '**' to HTML paragraph tags with bold text
+    response_text = re.sub(r"\*\*(.*?)\*\*", r"<p><strong>\1</strong></p>", response_text)
 
-    submit_btn.click(
-        fn=analyze_food,
-        inputs=[image_input, dietary_input, workflow_radio],
-        outputs=result_display
-    )
+    # Convert bullet points denoted by "*" to HTML list items
+    response_text = re.sub(r"(?m)^\s*\*\s(.*)", r"<li>\1</li>", response_text)
 
-# Launch the Gradio interface
+    # Wrap list items within <ul> tags for proper HTML structure and indentation
+    response_text = re.sub(r"(<li>.*?</li>)+", lambda match: f"<ul>{match.group(0)}</ul>", response_text, flags=re.DOTALL)
+
+    # Ensure that all paragraphs have a line break after them for better separation
+    response_text = re.sub(r"</p>(?=<p>)", r"</p><br>", response_text)
+
+    # Ensure the disclaimer and other distinct paragraphs have proper line breaks
+    response_text = re.sub(r"(\n|\\n)+", r"<br>", response_text)
+
+    return response_text
+
+def generate_model_response(encoded_image, user_query, assistant_prompt):
+    """
+    Sends an image and a query to the model and retrieves the description or answer.
+    Formats the response using HTML elements for better presentation.
+    """
+    # Create the messages object
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": assistant_prompt + "\n\n" + user_query},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded_image}}
+            ]
+        }
+    ]
+
+    try:
+        # Send the request to the model
+        response = model.chat(messages=messages)
+        raw_response = response['choices'][0]['message']['content']
+
+        # Format the raw response text using the format_response function
+        formatted_response = format_response(raw_response)
+        return formatted_response
+    except Exception as e:
+        print(f"Error in generating response: {e}")
+        return "<p>An error occurred while generating the response.</p>"
+    
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        # Retrieve user inputs
+        user_query = request.form.get("user_query")
+        uploaded_file = request.files.get("file")
+
+        if uploaded_file:
+            # Process the uploaded image
+            encoded_image = input_image_setup(uploaded_file)
+
+            if not encoded_image:
+                flash("Error processing the image. Please try again.", "danger")
+                return redirect(url_for("index"))
+
+            # Assistant prompt (can be customized)
+            assistant_prompt = """
+            You are an expert nutritionist. Your task is to analyze the food items displayed in the image and provide a detailed nutritional assessment using the following format:
+
+        1. **Identification**: List each identified food item clearly, one per line.
+        2. **Portion Size & Calorie Estimation**: For each identified food item, specify the portion size and provide an estimated number of calories. Use bullet points with the following structure:
+        - **[Food Item]**: [Portion Size], [Number of Calories] calories
+
+        Example:
+        *   **Salmon**: 6 ounces, 210 calories
+        *   **Asparagus**: 3 spears, 25 calories
+
+        3. **Total Calories**: Provide the total number of calories for all food items.
+
+        Example:
+        Total Calories: [Number of Calories]
+
+        4. **Nutrient Breakdown**: Include a breakdown of key nutrients such as **Protein**, **Carbohydrates**, **Fats**, **Vitamins**, and **Minerals**. Use bullet points, and for each nutrient provide details about the contribution of each food item.
+
+        Example:
+        *   **Protein**: Salmon (35g), Asparagus (3g), Tomatoes (1g) = [Total Protein]
+
+        5. **Health Evaluation**: Evaluate the healthiness of the meal in one paragraph.
+
+        6. **Disclaimer**: Include the following exact text as a disclaimer:
+
+        The nutritional information and calorie estimates provided are approximate and are based on general food data. 
+        Actual values may vary depending on factors such as portion size, specific ingredients, preparation methods, and individual variations. 
+        For precise dietary advice or medical guidance, consult a qualified nutritionist or healthcare provider.
+
+        Format your response exactly like the template above to ensure consistency.
+
+        """
+
+            # Generate the model's response
+            response = generate_model_response(encoded_image, user_query, assistant_prompt)
+
+            # Render the result
+            return render_template("index.html", user_query=user_query, response=response)
+
+        else:
+            flash("Please upload an image file.", "danger")
+            return redirect(url_for("index"))
+
+    return render_template("index.html")
+
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=5000)
+    app.run(debug=True)
