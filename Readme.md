@@ -222,7 +222,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 👨‍💻 Author
 
-Your Sheraz Tariq 
+Sheraz Tariq [https://www.linkedin.com/in/sheraz-tariq-12434a239/]
 
 Project Link: [https://github.com/sheraztariq22/AI-Nutrition-Coach](https://github.com/sheraztariq22/AI-Nutrition-Coach)
 
